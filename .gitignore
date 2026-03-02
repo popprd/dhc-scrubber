@@ -1,0 +1,12 @@
+# Data files — not committed (too large / potentially sensitive)
+*.csv
+progress.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Streamlit
+.streamlit/secrets.toml
