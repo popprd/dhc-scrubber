@@ -445,11 +445,18 @@ with st.sidebar:
         type=["csv"],
         help="Upload any CSV with imaging center data. Column names are auto-detected.",
     )
-    if uploaded:
-        _df, _cmap = load_and_init(uploaded)
-        st.session_state["df"]      = _df
-        st.session_state["col_map"] = _cmap
-        st.session_state["unsaved"] = False
+    if uploaded is not None:
+        # Only reload when it's a genuinely new file.
+        # Streamlit re-evaluates the uploader on every rerun (including after
+        # the scrubber finishes), so without this guard the fresh CSV would
+        # overwrite the just-categorised data on every rerun.
+        _file_key = f"{uploaded.name}_{uploaded.size}"
+        if st.session_state.get("_loaded_file_key") != _file_key:
+            _df, _cmap = load_and_init(uploaded)
+            st.session_state["df"]               = _df
+            st.session_state["col_map"]          = _cmap
+            st.session_state["unsaved"]          = False
+            st.session_state["_loaded_file_key"] = _file_key
 
     # ── Column mapping (shown after file loads) ────────────────────────────────
     if st.session_state["df"] is not None:
