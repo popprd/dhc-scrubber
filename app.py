@@ -279,6 +279,14 @@ def detect_columns(df_columns: list) -> dict:
 def _load_csv_shared(path: str):
     """Load and cache ONE shared copy of the CSV (no serialization overhead)."""
     df = pd.read_csv(path, encoding="utf-8-sig", dtype=str)
+
+    # Drop trailing empty rows immediately — Excel exports pad to ~1 M rows which
+    # can exhaust memory on Streamlit Cloud before any filtering is applied.
+    col_map_raw = detect_columns(df.columns.tolist())
+    _name_col = col_map_raw.get("name")
+    if _name_col and _name_col in df.columns:
+        df = df[df[_name_col].fillna("").str.strip().ne("")].reset_index(drop=True)
+
     col_map = detect_columns(df.columns.tolist())
 
     if not col_map["scrubber_category"]:
