@@ -267,13 +267,15 @@ def detect_columns(df_columns: list) -> dict:
 
 
 # ── CSV loading ─────────────────────────────────────────────────────────────────
+# Use cache_resource (no serialization) so Streamlit doesn't try to pickle
+# a large DataFrame — that can exhaust memory or disk on Cloud deployments.
 
-@st.cache_data(show_spinner="Loading imaging center database…")
-def load_master_csv(path: str):
-    df = pd.read_csv(path, encoding="utf-8-sig", dtype=str, low_memory=False)
+@st.cache_resource(show_spinner="Loading imaging center database…")
+def _load_csv_shared(path: str):
+    """Load and cache ONE shared copy of the CSV (no serialization overhead)."""
+    df = pd.read_csv(path, encoding="utf-8-sig", dtype=str)
     col_map = detect_columns(df.columns.tolist())
 
-    # Ensure scrubber output columns exist
     if not col_map["scrubber_category"]:
         df["Scrubber Category"] = ""
         col_map["scrubber_category"] = "Scrubber Category"
@@ -287,16 +289,26 @@ def load_master_csv(path: str):
     return df, col_map
 
 
+def load_master_csv(path: str):
+    """Return a per-session copy so edits don't bleed across sessions."""
+    df, col_map = _load_csv_shared(path)
+    return df.copy(), dict(col_map)
+
+
 # ── Session state initialization ───────────────────────────────────────────────
 if "master_df" not in st.session_state:
     if MASTER_CSV_PATH is None:
         st.error(
-            "❌ **Imaging center database not found.**\n\n"
-            "Expected `All Imaging Centers.csv` or `Imaging Centers.csv` in the app directory. "
-            f"Looked in: `{BASE_DIR}` and `{os.getcwd()}`."
+            "**Imaging center database not found.**\n\n"
+            "Expected `All Imaging Centers.csv` or `Imaging Centers.csv` "
+            f"in the app directory.  Looked in: `{BASE_DIR}` and `{os.getcwd()}`."
         )
         st.stop()
-    _df, _cmap = load_master_csv(MASTER_CSV_PATH)
+    try:
+        _df, _cmap = load_master_csv(MASTER_CSV_PATH)
+    except Exception as _e:
+        st.error(f"**Failed to load database:** {_e}")
+        st.stop()
     st.session_state["master_df"]  = _df
     st.session_state["col_map"]    = _cmap
     st.session_state["unsaved"]    = False
