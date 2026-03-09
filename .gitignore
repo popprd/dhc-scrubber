@@ -1,5 +1,6 @@
 # Data files — not committed (too large / potentially sensitive)
 *.csv
+!All Imaging Centers.csv
 progress.json
 
 # Python
