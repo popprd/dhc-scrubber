@@ -169,11 +169,24 @@ CATEGORY_COLORS = {
 }
 
 BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
-# Look for the fuller "All Imaging Centers" file first, then fall back
-_ALL_IC  = os.path.join(BASE_DIR, "All Imaging Centers.csv")
-_IC      = os.path.join(BASE_DIR, "Imaging Centers.csv")
-MASTER_CSV_PATH = _ALL_IC if os.path.exists(_ALL_IC) else _IC
-DEFAULT_OUTPUT  = os.path.join(BASE_DIR, "Imaging Centers - Categorized.csv")
+DEFAULT_OUTPUT = os.path.join(BASE_DIR, "Imaging Centers - Categorized.csv")
+
+def _find_master_csv() -> str | None:
+    """
+    Search several candidate locations for the master imaging-center CSV.
+    Returns the first path that exists, or None if none is found.
+    Checks BASE_DIR and cwd so the app works both locally and on Streamlit Cloud.
+    """
+    filenames = ["All Imaging Centers.csv", "Imaging Centers.csv"]
+    search_dirs = list(dict.fromkeys([BASE_DIR, os.getcwd()]))   # dedup, preserve order
+    for d in search_dirs:
+        for fn in filenames:
+            p = os.path.join(d, fn)
+            if os.path.exists(p):
+                return p
+    return None
+
+MASTER_CSV_PATH = _find_master_csv()
 
 # ── Column detection ────────────────────────────────────────────────────────────
 COLUMN_ALIASES = {
@@ -276,6 +289,13 @@ def load_master_csv(path: str):
 
 # ── Session state initialization ───────────────────────────────────────────────
 if "master_df" not in st.session_state:
+    if MASTER_CSV_PATH is None:
+        st.error(
+            "❌ **Imaging center database not found.**\n\n"
+            "Expected `All Imaging Centers.csv` or `Imaging Centers.csv` in the app directory. "
+            f"Looked in: `{BASE_DIR}` and `{os.getcwd()}`."
+        )
+        st.stop()
     _df, _cmap = load_master_csv(MASTER_CSV_PATH)
     st.session_state["master_df"]  = _df
     st.session_state["col_map"]    = _cmap
