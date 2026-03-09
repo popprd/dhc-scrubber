@@ -171,7 +171,7 @@ CATEGORY_COLORS = {
 BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_OUTPUT = os.path.join(BASE_DIR, "Imaging Centers - Categorized.csv")
 
-def _find_master_csv() -> str | None:
+def _find_master_csv():
     """
     Search several candidate locations for the master imaging-center CSV.
     Returns the first path that exists, or None if none is found.
