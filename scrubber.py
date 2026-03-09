@@ -3,12 +3,16 @@
 DHC Scrubber
 ============
 Categorizes imaging centers from Imaging Centers.csv by:
-  1. Scraping each center's website for service keywords
-  2. Falling back to center name + Primary Taxonomy if website is unavailable
+  1. Checking data fields (HOPD, then specialty ownership)
+  2. Scraping each center's website for service keywords
+  3. Falling back to center name + Primary Taxonomy if website is unavailable
 
 Categories assigned
 -------------------
-  Offers MRI/CT        – Website or name confirms MRI or CT services
+  HOPD                 – Health System Affiliated (0=Health System) == 0
+  ONO                  – Owned and operated by a specialty physician group (Orthopedic, Neurology, etc.)
+                         Supersedes "Offers MRI/CT" for specialty-group-owned centers
+  Offers MRI/CT        – Independent imaging center: website or name confirms MRI or CT services
   Mammography Only     – Breast / mammography focus; no MRI or CT detected
   Ultrasound Only      – Sonography / echo focus; no MRI or CT detected
   Cancer Center        – Radiation oncology / cancer-treatment facility
@@ -152,6 +156,45 @@ CLOSED_PAGE_RE = re.compile(
     r"out\s+of\s+business|this\s+location\s+is\s+closed|"
     r"this\s+office\s+is\s+closed|site\s+is\s+closed|"
     r"thank\s+you\s+for\s+your\s+years|we\s+have\s+served\s+our\s+last"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# ── Specialty / ONO patterns ───────────────────────────────────────────────────
+# ONO = Owned and Operated by a specialty physician group.
+# Applied when the center would otherwise be "Offers MRI/CT" but is actually
+# an ancillary imaging service within a specialty physician practice.
+
+SPECIALTY_NAME_RE = re.compile(
+    r"\b("
+    r"orthopedic[s]?|orthopaedic[s]?|"
+    r"neurology|neurolog(?:ical|y|ist)|neuroscience|neurosurg(?:ery|ical)?|"
+    r"spine\s+(?:center|clinic|group|institute|practice|associate)|"
+    r"spinal\s+(?:center|clinic|group|institute)|"
+    r"sports\s+medicine|sports\s+ortho|"
+    r"musculoskeletal|"
+    r"rheumatolog(?:y|ist|ical)|"
+    r"urology|urolog(?:ist|ical)|"
+    r"gastroenterolog(?:y|ist)|"
+    r"cardiology\s+(?:group|center|clinic|practice|associate)|"
+    r"heart\s+(?:group|clinic|center|institute)|"
+    r"physician[\s\-]owned|physician[\s\-]led|doctor[\s\-]owned|"
+    r"orthopedic\s+(?:group|center|clinic|practice|associate|surgical)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+SPECIALTY_WEBSITE_RE = re.compile(
+    r"\b("
+    r"orthopedic[s]?|orthopaedic[s]?|"
+    r"neurology|neurolog(?:ical|y|ist)|neuroscience|neurosurg(?:ery|ical)?|"
+    r"spine\s+(?:center|clinic|group|practice)|spinal\s+(?:center|clinic)|"
+    r"sports\s+medicine|sports\s+ortho|musculoskeletal|"
+    r"rheumatolog(?:y|ist)|"
+    r"urology|gastroenterolog(?:y|ist)|"
+    r"physician[\s\-]owned|physician[\s\-]led|doctor[\s\-]owned|"
+    r"our\s+(?:orthopedic|neurology|spine|sports)\s+practice|"
+    r"our\s+(?:orthopedic|neurology|spine|sports)\s+clinic"
     r")\b",
     re.IGNORECASE,
 )
@@ -316,6 +359,33 @@ def _all_matches(pattern, text, limit=4):
     return list({m.lower() for m in pattern.findall(text)})[:limit]
 
 
+def is_specialty_owned(name: str, physician_group_name: str, website_text: str = None):
+    """
+    Detect if center is owned/operated by a specialty physician group (ONO).
+    Returns (True/False, rationale_string).
+    Priority: physician group name → center name → website text.
+    """
+    pg = str(physician_group_name).strip() if physician_group_name else ""
+    pg_valid = pg and pg.lower() not in ("nan", "", "none")
+
+    if pg_valid:
+        m = SPECIALTY_NAME_RE.search(pg)
+        if m:
+            return True, f'Physician Group Parent Name "{pg}" indicates specialty group ownership ("{m.group().strip()}").'
+
+    if name:
+        m = SPECIALTY_NAME_RE.search(name)
+        if m:
+            return True, f'Center name indicates specialty group ownership ("{m.group().strip()}").'
+
+    if website_text:
+        m = SPECIALTY_WEBSITE_RE.search(website_text)
+        if m:
+            return True, f'Website content indicates specialty physician practice ("{m.group().strip()}").'
+
+    return False, ""
+
+
 def categorize_from_website(text: str):
     """
     Categorize based solely on website text.
@@ -431,11 +501,29 @@ def categorize_from_name_taxonomy(name: str, taxonomy: str, prefix: str = ""):
     return "Needs Review", f'{p}Could not determine services from name or taxonomy. Manual review recommended.'
 
 
-def classify_center(name: str, taxonomy: str, website_url: str):
+def classify_center(
+    name: str,
+    taxonomy: str,
+    website_url: str,
+    health_system_val: str = None,
+    physician_group_name: str = None,
+):
     """
     Full classification pipeline for one center.
+
+    Priority order:
+      1. HOPD  – if health_system_val == "0" (Health System Affiliated)
+      2. Normal pipeline (Closed → Cancer → Nuclear → Ignore → MRI/CT → Mammo → US)
+      3. ONO   – if result would be "Offers MRI/CT" AND center is specialty-group-owned
+
     Returns (category, rationale).
     """
+    # ── 1. HOPD check (data field takes highest priority) ──────────────────────
+    hs = str(health_system_val).strip() if health_system_val is not None else ""
+    if hs == "0":
+        return "HOPD", "[Data] Health System Affiliated = 0, indicating a hospital outpatient department (HOPD)."
+
+    # ── 2. Normal website / name-taxonomy pipeline ─────────────────────────────
     website_text = None
     website_error = None
 
@@ -448,20 +536,27 @@ def classify_center(name: str, taxonomy: str, website_url: str):
     if website_text:
         category, rationale = categorize_from_website(website_text)
         if category:
-            return category, f"[Website] {rationale}"
-        # Website loaded but no decisive keywords → try name/taxonomy as tiebreaker
-        prefix = "Website loaded but services could not be determined from content."
-        category, rationale = categorize_from_name_taxonomy(name, taxonomy, prefix=prefix)
-        return category, f"[Website + Name/Taxonomy] {rationale}"
-
-    # No website or fetch failed
-    if has_url and website_error:
-        prefix = f"Website unavailable ({website_error})."
+            source_tag = "[Website]"
+        else:
+            # Website loaded but no decisive keywords → try name/taxonomy as tiebreaker
+            prefix = "Website loaded but services could not be determined from content."
+            category, rationale = categorize_from_name_taxonomy(name, taxonomy, prefix=prefix)
+            source_tag = "[Website + Name/Taxonomy]"
     else:
-        prefix = "No website listed."
+        if has_url and website_error:
+            prefix = f"Website unavailable ({website_error})."
+        else:
+            prefix = "No website listed."
+        category, rationale = categorize_from_name_taxonomy(name, taxonomy, prefix=prefix)
+        source_tag = "[Name/Taxonomy]"
 
-    category, rationale = categorize_from_name_taxonomy(name, taxonomy, prefix=prefix)
-    return category, f"[Name/Taxonomy] {rationale}"
+    # ── 3. ONO check — only when result would be "Offers MRI/CT" ──────────────
+    if category == "Offers MRI/CT":
+        ono, ono_reason = is_specialty_owned(name, physician_group_name, website_text)
+        if ono:
+            return "ONO", f"[ONO] {ono_reason} Would otherwise be 'Offers MRI/CT'."
+
+    return category, f"{source_tag} {rationale}"
 
 
 # ── Worker ─────────────────────────────────────────────────────────────────────
@@ -469,12 +564,18 @@ def classify_center(name: str, taxonomy: str, website_url: str):
 def process_row(args):
     """Called by thread pool. Returns (df_index, category, rationale)."""
     df_idx, row = args
-    name     = str(row.get("Imaging Center Name", "")).strip()
-    taxonomy = str(row.get("Primary Taxonomy ", "")).strip()
-    website  = str(row.get("Website", "")).strip()
+    name             = str(row.get("Imaging Center Name", "")).strip()
+    taxonomy         = str(row.get("Primary Taxonomy ", "")).strip()
+    website          = str(row.get("Website", "")).strip()
+    health_system    = str(row.get("Health System Affiliated (0=Health System)", "")).strip()
+    physician_group  = str(row.get("Physician Group Parent Name", "")).strip()
 
     try:
-        category, rationale = classify_center(name, taxonomy, website)
+        category, rationale = classify_center(
+            name, taxonomy, website,
+            health_system_val=health_system,
+            physician_group_name=physician_group,
+        )
     except Exception as exc:
         category  = "Needs Review"
         rationale = f"[Error] Unexpected error during processing: {str(exc)[:200]}"
@@ -494,10 +595,10 @@ def main():
     # ── Load CSV ──
     logger.info("Loading %s …", INPUT_CSV)
     df = pd.read_csv(INPUT_CSV, encoding="utf-8-sig", dtype=str, low_memory=False)
-    df["Category"]  = df["Category"].fillna("")
-    df["Rationale"] = df["Rationale"].fillna("")
+    df["Scrubber Category"]  = df.get("Scrubber Category",  pd.Series("", index=df.index)).fillna("")
+    df["Scrubber Rationale"] = df.get("Scrubber Rationale", pd.Series("", index=df.index)).fillna("")
 
-    # Active rows only (have a Definitive ID / name)
+    # Active rows only (have a name)
     active_mask = df["Imaging Center Name"].fillna("").str.strip().ne("")
     active_df   = df[active_mask]
     logger.info("Active centers in file: %s", f"{len(active_df):,}")
@@ -515,8 +616,8 @@ def main():
 
     # Apply previously saved results back to df
     for idx_str, result in progress.items():
-        df.at[int(idx_str), "Category"]  = result["category"]
-        df.at[int(idx_str), "Rationale"] = result["rationale"]
+        df.at[int(idx_str), "Scrubber Category"]  = result["category"]
+        df.at[int(idx_str), "Scrubber Rationale"] = result["rationale"]
 
     # Build work queue (skip already done)
     to_process = [
@@ -556,8 +657,8 @@ def main():
                     progress_bar.update(1)
                 continue
 
-            df.at[df_idx, "Category"]  = category
-            df.at[df_idx, "Rationale"] = rationale
+            df.at[df_idx, "Scrubber Category"]  = category
+            df.at[df_idx, "Scrubber Rationale"] = rationale
             progress[str(df_idx)] = {"category": category, "rationale": rationale}
             done_count += 1
 
@@ -577,7 +678,7 @@ def main():
     logger.info("Finished. Output → %s", OUTPUT_CSV)
 
     # ── Summary ──
-    counts = df[active_mask]["Category"].value_counts()
+    counts = df[active_mask]["Scrubber Category"].value_counts()
     logger.info("\n── Category Summary ───────────────────────────────")
     for cat, n in counts.items():
         bar = "█" * min(40, int(40 * n / len(active_df)))
