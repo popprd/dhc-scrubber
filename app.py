@@ -483,97 +483,147 @@ def build_column_config(col_map: dict) -> dict:
 
 # ── Discover helpers ────────────────────────────────────────────────────────────
 
-def search_and_classify_centers(zip_codes: list, state_name: str, existing_domains: set):
+import re as _re
+
+def _normalize_name(name: str) -> str:
     """
-    Use DuckDuckGo Maps to find imaging centers near each zip code.
-    Filters out centers already in the master database (by domain).
-    Classifies each new center using the scrubber engine.
+    Normalize a center name for fuzzy deduplication against the master database.
+    Lowercases, strips common legal suffixes and punctuation.
+    """
+    n = name.lower().strip()
+    n = _re.sub(r'\b(inc|llc|corp|ltd|lp|pc|pllc|the|of|a)\b\.?', ' ', n)
+    n = _re.sub(r'[^\w\s]', ' ', n)
+    n = ' '.join(n.split())
+    return n
+
+
+def search_centers_nppes(zip_codes: list, state_abbrevs: list, existing_norm_names: set):
+    """
+    Query the free NPPES NPI Registry (CMS) for imaging-center organizations.
+
+    Strategy:
+      • If specific zip codes are selected → search zip-by-zip (fine-grained).
+      • If only states are selected (no zip filter) → search state-by-state
+        (far fewer API calls for large states).
+
+    Deduplicates against `existing_norm_names` (normalized names from the
+    master database) and across results by NPI number.
+    Classifies each new center using the scrubber engine (name + taxonomy;
+    NPPES does not expose website URLs).
     Returns a list of result dicts.
     """
-    from duckduckgo_search import DDGS
+    import requests as _req
 
-    SEARCH_QUERIES = [
-        "MRI imaging center",
-        "radiology imaging center",
-        "diagnostic imaging center",
-        "CT scan center",
+    NPPES_URL = "https://npiregistry.cms.hhs.gov/api/"
+    IMAGING_TAXONOMIES = [
+        "Radiology",
+        "Magnetic Resonance Imaging",
+        "Mammography",
+        "Diagnostic Ultrasound",
+        "Nuclear Radiology",
+        "Nuclear Medicine",
     ]
 
+    use_zips   = bool(zip_codes)
+    search_keys = zip_codes if use_zips else state_abbrevs
+
     results   = []
-    seen_titles  = set()
-    seen_domains = set(existing_domains)
+    seen_npis = set()
+    prog_ph   = st.empty()
 
-    total_zips = len(zip_codes)
-    prog_ph = st.empty()
+    total_steps = len(search_keys) * len(IMAGING_TAXONOMIES)
+    step = 0
 
-    with DDGS() as ddgs:
-        for zi, zc in enumerate(zip_codes, 1):
-            prog_ph.caption(f"Searching zip {zc} ({zi}/{total_zips})…")
-            for query in SEARCH_QUERIES:
+    for sk in search_keys:
+        for taxonomy in IMAGING_TAXONOMIES:
+            step += 1
+            label = f"zip {sk}" if use_zips else f"state {sk}"
+            prog_ph.caption(
+                f"Querying NPPES — {label}, {taxonomy}  ({step}/{total_steps})…"
+            )
+
+            skip  = 0
+            pages = 0
+            max_pages = 3   # cap at 600 results per taxonomy/location
+
+            while pages < max_pages:
                 try:
-                    maps_results = list(ddgs.maps(
-                        f"{query} {zc} {state_name}",
-                        place=f"{zc}",
-                        max_results=8,
-                    ))
+                    params = {
+                        "version":          "2.1",
+                        "enumeration_type": "NPI-2",   # organizations only
+                        "taxonomy_description": taxonomy,
+                        "limit": 200,
+                        "skip":  skip,
+                    }
+                    if use_zips:
+                        params["postal_code"] = sk
+                    else:
+                        params["state"] = sk
+
+                    resp = _req.get(NPPES_URL, params=params, timeout=15)
+                    data = resp.json()
                 except Exception:
-                    # maps() unavailable — fall back to text search
+                    break
+
+                batch = data.get("results", [])
+                if not batch:
+                    break
+
+                for r in batch:
+                    npi  = r.get("number", "")
+                    if npi in seen_npis:
+                        continue
+                    seen_npis.add(npi)
+
+                    basic = r.get("basic", {})
+                    name  = basic.get("organization_name", "").strip()
+                    if not name:
+                        continue
+
+                    # Skip if already in master database (normalized name match)
+                    if _normalize_name(name) in existing_norm_names:
+                        continue
+
+                    addrs = r.get("addresses", [])
+                    addr  = next(
+                        (a for a in addrs if a.get("address_purpose") == "LOCATION"),
+                        addrs[0] if addrs else {},
+                    )
+
+                    tax_list    = r.get("taxonomies", [])
+                    primary_tax = next(
+                        (t.get("desc", "") for t in tax_list if t.get("primary")),
+                        tax_list[0].get("desc", "") if tax_list else taxonomy,
+                    )
+
                     try:
-                        text_results = list(ddgs.text(
-                            f"{query} near {zc} {state_name}",
-                            max_results=5,
-                        ))
-                        maps_results = [
-                            {
-                                "title":   r.get("title", ""),
-                                "website": r.get("href", ""),
-                                "address": "",
-                                "city": "",
-                                "state": state_name,
-                                "postalCode": zc,
-                                "phone": "",
-                            }
-                            for r in text_results
-                        ]
-                    except Exception:
-                        maps_results = []
-
-                for r in maps_results:
-                    title   = (r.get("title") or "").strip()
-                    website = (r.get("website") or r.get("href") or "").strip()
-                    domain  = extract_domain(website)
-
-                    if not title:
-                        continue
-                    title_key = title.lower()
-                    if title_key in seen_titles:
-                        continue
-                    seen_titles.add(title_key)
-                    if domain and domain in seen_domains:
-                        continue
-                    if domain:
-                        seen_domains.add(domain)
-
-                    # Classify
-                    try:
-                        cat, rat = classify_center(title, "", website or "")
+                        cat, rat = classify_center(
+                            name, primary_tax, "",
+                            health_system_val=None,
+                            physician_group_name=None,
+                        )
                     except Exception:
                         cat, rat = "Needs Review", "Classification error."
 
+                    zip_raw = addr.get("postal_code", "")
                     results.append({
-                        "Name":               title,
-                        "Address":            r.get("address", ""),
-                        "City":               r.get("city", ""),
-                        "State":              r.get("state", state_name),
-                        "Zip":                r.get("postalCode", zc),
-                        "Phone":              r.get("phone", ""),
-                        "Website":            website,
+                        "Name":               name,
+                        "NPI":                npi,
+                        "Address":            addr.get("address_1", ""),
+                        "City":               addr.get("city", ""),
+                        "State":              addr.get("state", "" if use_zips else sk),
+                        "Zip":                zip_raw[:5] if zip_raw else "",
+                        "Phone":              addr.get("telephone_number", ""),
+                        "Taxonomy":           primary_tax,
                         "Scrubber Category":  cat,
                         "Scrubber Rationale": rat,
-                        "Found Via Zip":      zc,
                     })
 
-                time.sleep(0.3)  # polite delay between queries
+                if len(batch) < 200:
+                    break
+                skip  += 200
+                pages += 1
+                time.sleep(0.3)   # polite delay
 
     prog_ph.empty()
     return results
@@ -653,7 +703,7 @@ Select **State(s)** then **Zip Code(s)** to filter the results.
 - 🔴 Closed
 - 🟡 Needs Review
 
-**Discover tab:** Searches DuckDuckGo Maps for imaging centers not already in the database for your selected zip codes.
+**Discover tab:** Queries the free NPPES NPI Registry (CMS) for imaging-center organizations not already in the database. Searches by zip code (if zip codes selected) or by whole state. No API key required.
         """)
 
 
@@ -830,59 +880,73 @@ with tab_results:
 # ════════════════════════════════════════════════════════════════════════════════
 with tab_discover:
 
-    state_col = C("state")
-    zip_col   = C("zip")
-    web_col   = C("website")
+    name_col_disc = C("name")
 
-    # Build set of domains already in the master database
-    existing_domains: set = set()
-    if web_col and web_col in master_df.columns:
-        for url in master_df[web_col].dropna():
-            d = extract_domain(str(url))
-            if d:
-                existing_domains.add(d)
+    # Build set of normalized center names from the master database for dedup
+    existing_norm_names: set = set()
+    if name_col_disc and name_col_disc in master_df.columns:
+        for _n in master_df[name_col_disc].dropna():
+            _nn = _normalize_name(str(_n))
+            if _nn:
+                existing_norm_names.add(_nn)
 
-    # Determine the state label to pass to search
-    state_label = ", ".join(selected_states) if selected_states else ""
+    # Decide search mode: zip-based (specific zips selected) vs state-based
+    use_zip_search = bool(selected_zips)
+    search_scope   = selected_zips if use_zip_search else selected_states
 
-    # Which zips to search
-    search_zips = selected_zips if selected_zips else _zips_available
+    if use_zip_search:
+        scope_label = f"{len(search_scope)} zip code(s)"
+        est_calls   = len(search_scope) * 6
+    else:
+        scope_label = f"all of {', '.join(selected_states)}"
+        est_calls   = len(selected_states) * 6
 
     st.markdown("#### 🔍 Discover Imaging Centers Not in the Database")
     st.markdown(
-        f"Searches DuckDuckGo Maps for imaging centers near each zip code "
-        f"(**{len(search_zips)} zip codes**) in the selected area, then filters out centers "
-        f"already in the database (matched by website domain)."
+        f"Queries the **NPPES NPI Registry** (CMS) for imaging organizations in "
+        f"**{scope_label}**, then filters out centers already in the master database "
+        f"(matched by normalized name). No API key required."
     )
 
-    if not search_zips:
-        st.info("Select at least one state (and optionally zip codes) in the sidebar to enable discovery search.")
+    if not selected_states:
+        st.info("Select at least one state in the sidebar to enable discovery search.")
     else:
         _col_btn, _col_info = st.columns([1, 3])
         with _col_btn:
-            run_discover = st.button("🔍 Search for Unlisted Centers", type="primary", use_container_width=True)
+            run_discover = st.button(
+                "🔍 Search NPPES Registry", type="primary", use_container_width=True
+            )
         with _col_info:
             st.caption(
-                f"Will search {len(search_zips)} zip code(s) × 4 query types = up to "
-                f"{len(search_zips) * 4 * 8:,} candidate results. "
-                f"Estimated time: {max(1, len(search_zips) * 20 // 60)}–{max(2, len(search_zips) * 40 // 60)} min."
+                f"Will make ~{est_calls} NPPES API calls (6 imaging taxonomies × "
+                f"{'each zip' if use_zip_search else 'each state'}). "
+                f"Estimated time: {max(1, est_calls // 10)}–{max(2, est_calls // 5)} sec."
             )
 
         if run_discover:
-            with st.spinner("Searching…"):
-                results = search_and_classify_centers(search_zips, state_label, existing_domains)
-            st.session_state["discover_results"] = results
-            if results:
-                st.success(f"Found **{len(results)}** potential centers not in the database.")
+            with st.spinner("Querying NPPES NPI Registry…"):
+                _disc_results = search_centers_nppes(
+                    zip_codes     = selected_zips,
+                    state_abbrevs = selected_states,
+                    existing_norm_names = existing_norm_names,
+                )
+            st.session_state["discover_results"] = _disc_results
+            if _disc_results:
+                st.success(
+                    f"Found **{len(_disc_results)}** organizations not already in the database."
+                )
             else:
-                st.warning("No new centers found for the selected zip codes.")
+                st.warning(
+                    "No new imaging centers found. All NPPES results matched existing "
+                    "database entries, or NPPES returned no results for this area."
+                )
 
         discover_results = st.session_state.get("discover_results")
 
         if discover_results:
             disc_df = pd.DataFrame(discover_results)
 
-            # Category filter for discover results
+            # Category filter
             disc_cat_filter = st.multiselect(
                 "Filter by Category",
                 options=CATEGORIES,
@@ -893,32 +957,29 @@ with tab_discover:
             if disc_cat_filter:
                 disc_df = disc_df[disc_df["Scrubber Category"].isin(disc_cat_filter)]
 
-            st.caption(f"Showing **{len(disc_df)}** discovered centers")
-
-            # Fix website URLs
-            if "Website" in disc_df.columns:
-                disc_df["Website"] = disc_df["Website"].apply(
-                    lambda u: (u if str(u).startswith("http") else f"https://{u}")
-                    if u and str(u).strip() not in ("", "nan") else None
-                )
+            st.caption(f"Showing **{len(disc_df):,}** discovered centers")
 
             disc_config = {
-                "Name":               st.column_config.TextColumn("Name", width="large"),
-                "Address":            st.column_config.TextColumn("Address", width="medium"),
-                "City":               st.column_config.TextColumn("City", width="small"),
-                "State":              st.column_config.TextColumn("State", width="small"),
-                "Zip":                st.column_config.TextColumn("Zip", width="small"),
-                "Phone":              st.column_config.TextColumn("Phone", width="medium"),
-                "Website":            st.column_config.LinkColumn("Website", width="medium", display_text="🔗 Visit"),
+                "Name":     st.column_config.TextColumn("Name",     width="large"),
+                "NPI":      st.column_config.TextColumn("NPI",      width="small"),
+                "Address":  st.column_config.TextColumn("Address",  width="medium"),
+                "City":     st.column_config.TextColumn("City",     width="small"),
+                "State":    st.column_config.TextColumn("State",    width="small"),
+                "Zip":      st.column_config.TextColumn("Zip",      width="small"),
+                "Phone":    st.column_config.TextColumn("Phone",    width="medium"),
+                "Taxonomy": st.column_config.TextColumn("Taxonomy", width="medium"),
                 "Scrubber Category":  st.column_config.SelectboxColumn(
-                                          "Scrubber Category", options=CATEGORIES, width="medium"
-                                      ),
-                "Scrubber Rationale": st.column_config.TextColumn("Scrubber Rationale", width="large"),
-                "Found Via Zip":      st.column_config.TextColumn("Found Via Zip", width="small"),
+                    "Scrubber Category", options=CATEGORIES, width="medium"
+                ),
+                "Scrubber Rationale": st.column_config.TextColumn(
+                    "Scrubber Rationale", width="large"
+                ),
             }
 
-            col_order = ["Name", "Address", "City", "State", "Zip", "Phone",
-                         "Website", "Scrubber Category", "Scrubber Rationale", "Found Via Zip"]
+            col_order = [
+                "Name", "NPI", "Address", "City", "State", "Zip", "Phone",
+                "Taxonomy", "Scrubber Category", "Scrubber Rationale",
+            ]
             col_order = [c for c in col_order if c in disc_df.columns]
 
             edited_disc = st.data_editor(
