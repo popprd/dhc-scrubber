@@ -497,7 +497,34 @@ def _normalize_name(name: str) -> str:
     return n
 
 
-def search_centers_nppes(zip_codes: list, state_abbrevs: list, existing_norm_names: set):
+def _normalize_address(addr: str) -> str:
+    """
+    Normalize a street address line for deduplication.
+    Lowercases, removes punctuation, standardizes the most common
+    street-type abbreviations so that e.g. 'Suite' == 'Ste',
+    'Street' == 'St', etc.
+    """
+    n = addr.lower().strip()
+    n = _re.sub(r'[#.,]', ' ', n)
+    n = _re.sub(r'\bsuite\b',     'ste',   n)
+    n = _re.sub(r'\bstreet\b',    'st',    n)
+    n = _re.sub(r'\bavenue\b',    'ave',   n)
+    n = _re.sub(r'\bdrive\b',     'dr',    n)
+    n = _re.sub(r'\bboulevard\b', 'blvd',  n)
+    n = _re.sub(r'\broad\b',      'rd',    n)
+    n = _re.sub(r'\blane\b',      'ln',    n)
+    n = _re.sub(r'\bcourt\b',     'ct',    n)
+    n = _re.sub(r'\bplace\b',     'pl',    n)
+    n = ' '.join(n.split())
+    return n
+
+
+def search_centers_nppes(
+    zip_codes: list,
+    state_abbrevs: list,
+    existing_norm_names: set,
+    existing_addr_zips: set,
+):
     """
     Query the free NPPES NPI Registry (CMS) for imaging-center organizations.
 
@@ -580,15 +607,37 @@ def search_centers_nppes(zip_codes: list, state_abbrevs: list, existing_norm_nam
                     if not name:
                         continue
 
-                    # Skip if already in master database (normalized name match)
-                    if _normalize_name(name) in existing_norm_names:
-                        continue
-
                     addrs = r.get("addresses", [])
                     addr  = next(
                         (a for a in addrs if a.get("address_purpose") == "LOCATION"),
                         addrs[0] if addrs else {},
                     )
+
+                    # ── Geography filter ─────────────────────────────────────
+                    # NPPES matches on billing/mailing state, which can differ
+                    # from the practice location. Enforce that the LOCATION
+                    # address actually falls in the searched state / zip.
+                    zip_raw   = addr.get("postal_code", "")
+                    zip5      = zip_raw[:5] if zip_raw else ""
+                    loc_state = addr.get("state", "")
+
+                    if use_zips:
+                        if zip5 != sk:
+                            continue
+                    else:
+                        if loc_state != sk:
+                            continue
+
+                    # ── Dedup against master database ────────────────────────
+                    # 1) Normalized name match
+                    if _normalize_name(name) in existing_norm_names:
+                        continue
+
+                    # 2) Address line 1 + zip match (catches same location
+                    #    even when the trading name differs)
+                    addr1_norm = _normalize_address(addr.get("address_1", ""))
+                    if addr1_norm and zip5 and (addr1_norm, zip5) in existing_addr_zips:
+                        continue
 
                     tax_list    = r.get("taxonomies", [])
                     primary_tax = next(
@@ -605,14 +654,13 @@ def search_centers_nppes(zip_codes: list, state_abbrevs: list, existing_norm_nam
                     except Exception:
                         cat, rat = "Needs Review", "Classification error."
 
-                    zip_raw = addr.get("postal_code", "")
                     results.append({
                         "Name":               name,
                         "NPI":                npi,
                         "Address":            addr.get("address_1", ""),
                         "City":               addr.get("city", ""),
-                        "State":              addr.get("state", "" if use_zips else sk),
-                        "Zip":                zip_raw[:5] if zip_raw else "",
+                        "State":              loc_state,
+                        "Zip":                zip5,
                         "Phone":              addr.get("telephone_number", ""),
                         "Taxonomy":           primary_tax,
                         "Scrubber Category":  cat,
@@ -881,14 +929,26 @@ with tab_results:
 with tab_discover:
 
     name_col_disc = C("name")
+    addr_col_disc = C("address")
+    zip_col_disc  = C("zip")
 
-    # Build set of normalized center names from the master database for dedup
+    # Build normalized-name set for name-based dedup
     existing_norm_names: set = set()
     if name_col_disc and name_col_disc in master_df.columns:
         for _n in master_df[name_col_disc].dropna():
             _nn = _normalize_name(str(_n))
             if _nn:
                 existing_norm_names.add(_nn)
+
+    # Build (normalized_address, zip5) set for address+zip dedup
+    existing_addr_zips: set = set()
+    if (addr_col_disc and addr_col_disc in master_df.columns
+            and zip_col_disc and zip_col_disc in master_df.columns):
+        for _, _row in master_df[[addr_col_disc, zip_col_disc]].iterrows():
+            _a = _normalize_address(str(_row[addr_col_disc]))
+            _z = str(_row[zip_col_disc]).strip()[:5]
+            if _a and _z and _a not in ("nan", ""):
+                existing_addr_zips.add((_a, _z))
 
     # Decide search mode: zip-based (specific zips selected) vs state-based
     use_zip_search = bool(selected_zips)
@@ -926,9 +986,10 @@ with tab_discover:
         if run_discover:
             with st.spinner("Querying NPPES NPI Registry…"):
                 _disc_results = search_centers_nppes(
-                    zip_codes     = selected_zips,
-                    state_abbrevs = selected_states,
+                    zip_codes           = selected_zips,
+                    state_abbrevs       = selected_states,
                     existing_norm_names = existing_norm_names,
+                    existing_addr_zips  = existing_addr_zips,
                 )
             st.session_state["discover_results"] = _disc_results
             if _disc_results:
