@@ -227,6 +227,8 @@ COLUMN_ALIASES = {
     ],
     "address":   ["Address", "Address1", "Street Address", "Street"],
     "phone":     ["Phone", "Phone Number", "Telephone", "Tel"],
+    "parent":    ["Parent (Master)", "Parent Master", "Parent", "Network Parent",
+                  "Network Parent (or Network IF Network Parent is blank)"],
     "scrubber_category":  ["Scrubber Category"],
     "scrubber_rationale": ["Scrubber Rationale"],
 }
@@ -412,7 +414,7 @@ def run_scrubber(df: pd.DataFrame, indices, workers: int = 8):
 
 
 def build_display_cols(col_map: dict, available: list) -> list:
-    order = ["name", "city", "state", "zip", "cbsa",
+    order = ["name", "address", "city", "state", "zip", "cbsa", "parent",
              "scrubber_category", "scrubber_rationale",
              "website", "dhc_link", "health_system", "physician_group"]
     return [col_map[k] for k in order if col_map.get(k) and col_map[k] in available]
@@ -422,13 +424,15 @@ def build_column_config(col_map: dict) -> dict:
     config = {}
 
     for key, label, width in [
-        ("name",     "Center Name",           "large"),
-        ("city",     "City",                  "small"),
-        ("state",    "State",                 "small"),
-        ("zip",      "Zip Code",              "small"),
-        ("cbsa",     "CBSA",                  "medium"),
-        ("health_system",   "HS Affiliated",  "small"),
-        ("physician_group", "Physician Group","medium"),
+        ("name",             "Center Name",    "large"),
+        ("address",          "Address",        "medium"),
+        ("city",             "City",           "small"),
+        ("state",            "State",          "small"),
+        ("zip",              "Zip Code",       "small"),
+        ("cbsa",             "CBSA",           "medium"),
+        ("parent",           "Parent",         "medium"),
+        ("health_system",    "HS Affiliated",  "small"),
+        ("physician_group",  "Physician Group","medium"),
     ]:
         col = col_map.get(key)
         if col:
