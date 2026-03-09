@@ -771,7 +771,7 @@ with tab_results:
 
     edited = st.data_editor(
         display_df,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         num_rows="fixed",
         height=550,
@@ -915,7 +915,7 @@ with tab_discover:
 
             edited_disc = st.data_editor(
                 disc_df[col_order].reset_index(drop=True),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 height=520,
                 column_config=disc_config,
@@ -964,7 +964,7 @@ with tab_summary:
             margin=dict(l=10, r=60, t=20, b=20),
             height=420,
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
     with col_table:
         st.markdown("#### Counts by Category")
@@ -1021,7 +1021,7 @@ with tab_summary:
                 margin=dict(l=10, r=10, t=20, b=20),
                 height=320,
             )
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width="stretch")
 
     # Needs Review spotlight
     needs_review_df = working_df[working_df[cat_col] == "Needs Review"]
@@ -1033,6 +1033,6 @@ with tab_summary:
         with st.expander(f"🔍 {len(needs_review_df):,} centers need manual review"):
             st.dataframe(
                 needs_review_df[review_display].reset_index(drop=True),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
