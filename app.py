@@ -171,6 +171,9 @@ CATEGORY_COLORS = {
 BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_OUTPUT = os.path.join(BASE_DIR, "Imaging Centers - Categorized.csv")
 
+# Increment this whenever col_map structure changes — forces stale sessions to reset
+APP_VERSION = 5
+
 def _find_master_csv():
     """
     Search several candidate locations for the master imaging-center CSV.
@@ -294,10 +297,24 @@ def _load_csv_shared(path: str):
 def load_master_csv(path: str):
     """Return a per-session copy so edits don't bleed across sessions."""
     df, col_map = _load_csv_shared(path)
-    return df.copy(), dict(col_map)
+    col_map = dict(col_map)   # fresh copy every call
+
+    # Direct fallback: if detect_columns missed "Parent (Master)", find it explicitly
+    if not col_map.get("parent"):
+        for c in df.columns:
+            if c.strip() == "Parent (Master)":
+                col_map["parent"] = c
+                break
+
+    return df.copy(), col_map
 
 
 # ── Session state initialization ───────────────────────────────────────────────
+# Reset stale sessions when APP_VERSION changes (e.g. col_map structure updated)
+if st.session_state.get("_app_version") != APP_VERSION:
+    for _k in list(st.session_state.keys()):
+        del st.session_state[_k]
+
 if "master_df" not in st.session_state:
     if MASTER_CSV_PATH is None:
         st.error(
@@ -311,9 +328,10 @@ if "master_df" not in st.session_state:
     except Exception as _e:
         st.error(f"**Failed to load database:** {_e}")
         st.stop()
-    st.session_state["master_df"]  = _df
-    st.session_state["col_map"]    = _cmap
-    st.session_state["unsaved"]    = False
+    st.session_state["master_df"]    = _df
+    st.session_state["col_map"]      = _cmap
+    st.session_state["unsaved"]      = False
+    st.session_state["_app_version"] = APP_VERSION
 
 if "discover_results" not in st.session_state:
     st.session_state["discover_results"] = None
